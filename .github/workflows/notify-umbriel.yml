@@ -3,6 +3,8 @@ name: Notify Umbriel
 on:
   push:
     branches: [main]
+  # Manual re-sync; run it from main so Umbriel accepts the dispatch.
+  workflow_dispatch:
 
 permissions: {}
 
@@ -11,9 +13,21 @@ jobs:
     if: ${{ github.repository == 'noctalia-dev/xdg-desktop-portal-umbriel' }}
     runs-on: ubuntu-latest
     steps:
+      # Short-lived token from the Noctalia Automation GitHub App, limited to
+      # writing Umbriel's contents (what repository_dispatch requires).
+      - name: Create Noctalia Automation token for Umbriel
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.AUTOMATION_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
+          owner: noctalia-dev
+          repositories: umbriel
+          permission-contents: write
+
       - name: Dispatch Umbriel portal input update
         env:
-          GH_TOKEN: ${{ secrets.UMBRIEL_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           gh api \
             --method POST \
