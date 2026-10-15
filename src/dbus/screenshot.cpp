@@ -127,6 +127,32 @@ namespace xdpu {
         }
       }
 
+      // The capture is in the output's untransformed buffer orientation; write
+      // the PNG as the output displays it.
+      if (shot.transform != 0) {
+        const auto width = static_cast<int32_t>(shot.width);
+        const auto height = static_cast<int32_t>(shot.height);
+        const bool swapAxes = (shot.transform & 1U) != 0;
+        const int32_t displayWidth = swapAxes ? height : width;
+        const int32_t displayHeight = swapAxes ? width : height;
+        const size_t displayStride = static_cast<size_t>(displayWidth) * 4;
+        std::vector<uint8_t> display(displayStride * static_cast<size_t>(displayHeight));
+        for (int32_t y = 0; y < displayHeight; ++y) {
+          for (int32_t x = 0; x < displayWidth; ++x) {
+            const auto [bx, by] = displayToBuffer(x, y, width, height, shot.transform);
+            std::memcpy(
+                &display[static_cast<size_t>(y) * displayStride + static_cast<size_t>(x) * 4],
+                &shot.pixels[static_cast<size_t>(by) * shot.stride + static_cast<size_t>(bx) * 4], 4
+            );
+          }
+        }
+        shot.pixels = std::move(display);
+        shot.width = static_cast<uint32_t>(displayWidth);
+        shot.height = static_cast<uint32_t>(displayHeight);
+        shot.stride = static_cast<uint32_t>(displayStride);
+        shot.transform = 0;
+      }
+
       auto dir = runtimeDir();
       if (!dir) {
         return std::nullopt;
