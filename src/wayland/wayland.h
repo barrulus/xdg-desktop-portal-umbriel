@@ -53,6 +53,33 @@ namespace xdpu {
     void* data = nullptr;
     size_t size = 0;
   };
+
+  struct BufferPoint {
+    int32_t x = 0;
+    int32_t y = 0;
+  };
+
+  // Maps a pixel in an output's displayed orientation onto a capture buffer of
+  // bufferWidth x bufferHeight carrying `transform` (a wl_output.transform).
+  // Rotations by 90 or 270 degrees swap the displayed axes.
+  inline BufferPoint
+  displayToBuffer(int32_t x, int32_t y, int32_t bufferWidth, int32_t bufferHeight, uint32_t transform) {
+    const int32_t displayWidth = (transform & 1U) != 0 ? bufferHeight : bufferWidth;
+    // Invert the horizontal flip first, then the rotation, mirroring how
+    // wl_output.transform composes them.
+    const int32_t fx = (transform & 4U) != 0 ? displayWidth - 1 - x : x;
+    switch (transform & 3U) {
+    case 1:
+      return {y, bufferHeight - 1 - fx};
+    case 2:
+      return {bufferWidth - 1 - fx, bufferHeight - 1 - y};
+    case 3:
+      return {bufferWidth - 1 - y, fx};
+    default:
+      return {fx, y};
+    }
+  }
+
   struct DmabufPlane {
     int fd = -1;
     uint32_t stride = 0;
@@ -179,6 +206,7 @@ namespace xdpu {
       uint32_t height = 0;
       uint32_t stride = 0;
       uint32_t format = 0;
+      uint32_t transform = 0; // wl_output.transform of the captured content
     };
 
     struct wl_buffer* createDmabufBuffer(

@@ -204,45 +204,57 @@ namespace xdpu {
     std::optional<Color> sampleColor(
         const WaylandContext::ScreenshotResult& shot, const OutputInfo& output, int32_t globalX, int32_t globalY
     ) {
-      if (shot.format != DRM_FORMAT_XRGB8888 && shot.format != DRM_FORMAT_ARGB8888) {
+      // Little-endian DRM formats: XRGB/ARGB store B,G,R in memory, XBGR/ABGR R,G,B.
+      bool bgr = false;
+      switch (shot.format) {
+      case DRM_FORMAT_XRGB8888:
+      case DRM_FORMAT_ARGB8888:
+        break;
+      case DRM_FORMAT_XBGR8888:
+      case DRM_FORMAT_ABGR8888:
+        bgr = true;
+        break;
+      default:
         return std::nullopt;
       }
       if (shot.width == 0 || shot.height == 0 || shot.stride < shot.width * 4 || shot.pixels.empty()) {
         return std::nullopt;
       }
 
-      // The point is in global logical coordinates; the capture is in buffer
-      // pixels, which differ under fractional scale.  Without xdg-output, fall
-      // back to the mode geometry, which is only right at scale 1 at the origin.
+      // The capture is in the output's untransformed buffer orientation; a
+      // rotated output displays it with width and height swapped.
+      const bool swapAxes = (shot.transform & 1U) != 0;
+      const auto displayWidth = static_cast<int32_t>(swapAxes ? shot.height : shot.width);
+      const auto displayHeight = static_cast<int32_t>(swapAxes ? shot.width : shot.height);
+
+      // The point is in global logical coordinates, which differ from buffer
+      // pixels under fractional scale.  Without xdg-output, assume scale 1 at
+      // the wl_output position.
       const bool logical = output.logicalWidth > 0 && output.logicalHeight > 0;
       const int32_t originX = logical ? output.logicalX : output.x;
       const int32_t originY = logical ? output.logicalY : output.y;
-      const int32_t width = logical ? output.logicalWidth : output.width;
-      const int32_t height = logical ? output.logicalHeight : output.height;
+      const int32_t width = logical ? output.logicalWidth : displayWidth;
+      const int32_t height = logical ? output.logicalHeight : displayHeight;
 
-      double localX = static_cast<double>(globalX - originX);
-      double localY = static_cast<double>(globalY - originY);
-      if (width > 0) {
-        localX *= static_cast<double>(shot.width) / static_cast<double>(width);
-      }
-      if (height > 0) {
-        localY *= static_cast<double>(shot.height) / static_cast<double>(height);
-      }
+      const double localX =
+          static_cast<double>(globalX - originX) * static_cast<double>(displayWidth) / static_cast<double>(width);
+      const double localY =
+          static_cast<double>(globalY - originY) * static_cast<double>(displayHeight) / static_cast<double>(height);
+      const int32_t dx = std::clamp(static_cast<int32_t>(std::floor(localX)), int32_t{0}, displayWidth - 1);
+      const int32_t dy = std::clamp(static_cast<int32_t>(std::floor(localY)), int32_t{0}, displayHeight - 1);
 
-      const int32_t px =
-          std::clamp(static_cast<int32_t>(std::floor(localX)), int32_t{0}, static_cast<int32_t>(shot.width - 1));
-      const int32_t py =
-          std::clamp(static_cast<int32_t>(std::floor(localY)), int32_t{0}, static_cast<int32_t>(shot.height - 1));
+      const auto [px, py] =
+          displayToBuffer(dx, dy, static_cast<int32_t>(shot.width), static_cast<int32_t>(shot.height), shot.transform);
       const size_t offset = static_cast<size_t>(py) * shot.stride + static_cast<size_t>(px) * 4;
       if (offset + 2 >= shot.pixels.size()) {
         return std::nullopt;
       }
 
       constexpr double scale = 1.0 / 255.0;
-      const double b = static_cast<double>(shot.pixels[offset + 0]) * scale;
+      const double first = static_cast<double>(shot.pixels[offset + 0]) * scale;
       const double g = static_cast<double>(shot.pixels[offset + 1]) * scale;
-      const double r = static_cast<double>(shot.pixels[offset + 2]) * scale;
-      return Color{r, g, b};
+      const double third = static_cast<double>(shot.pixels[offset + 2]) * scale;
+      return bgr ? Color{first, g, third} : Color{third, g, first};
     }
 
   } // namespace
@@ -483,7 +495,7 @@ namespace xdpu {
             *cap.session, cap.buffer, /*damageBuffer=*/true,
             /*onReady=*/
             [weakSelf, format, stride,
-             onComplete = std::move(onComplete)](CaptureBuffer& /*buf*/, uint64_t /*ptsSec*/, uint32_t /*ptsNsec*/) {
+             onComplete = std::move(onComplete)](CaptureBuffer& buf, uint64_t /*ptsSec*/, uint32_t /*ptsNsec*/) {
               auto self = weakSelf.lock();
               if (!self || self->done || !self->capture) {
                 return;
@@ -494,6 +506,7 @@ namespace xdpu {
               shot.height = c.constraints.bufferHeight;
               shot.stride = stride;
               shot.format = format;
+              shot.transform = buf.transform;
               shot.pixels.resize(c.mappingSize);
               std::memcpy(shot.pixels.data(), c.mapping, c.mappingSize);
               onComplete(self, std::move(shot));
