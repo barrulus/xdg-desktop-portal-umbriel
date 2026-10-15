@@ -23,10 +23,18 @@ namespace xdpu {
   struct OutputInfo {
     std::string name;
     std::string description;
+    // Current mode size in buffer pixels, and the wl_output.geometry position
+    // (wlroots compositors always report 0,0).
     int32_t width = 0;
     int32_t height = 0;
     int32_t x = 0;
     int32_t y = 0;
+    // Layout position and size in logical coordinates, from xdg-output; zero
+    // until the compositor reports them.
+    int32_t logicalX = 0;
+    int32_t logicalY = 0;
+    int32_t logicalWidth = 0;
+    int32_t logicalHeight = 0;
   };
 
   struct ToplevelInfo {

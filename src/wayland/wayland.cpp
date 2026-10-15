@@ -22,6 +22,7 @@
 #include <unordered_map>
 #include <utility>
 #include <wayland-client.h>
+#include <xdg-output-unstable-v1-client-protocol.h>
 
 namespace xdpu {
 
@@ -37,6 +38,8 @@ namespace xdpu {
   struct WaylandContext::Impl {
     struct OutputState {
       wl_output* output = nullptr;
+      zxdg_output_v1* xdgOutput = nullptr;
+      Impl* owner = nullptr;
       OutputInfo info;
       uint32_t registryName = 0;
       bool hasName = false;
@@ -64,6 +67,7 @@ namespace xdpu {
     ext_foreign_toplevel_image_capture_source_manager_v1* toplevelSourceManager = nullptr;
     ext_image_copy_capture_manager_v1* captureManager = nullptr;
     ext_foreign_toplevel_list_v1* toplevelList = nullptr;
+    zxdg_output_manager_v1* xdgOutputManager = nullptr;
 
     int displayFdId = 0;
     bool preparedRead = false;
@@ -272,8 +276,14 @@ namespace xdpu {
         shm = nullptr;
       }
       for (auto& [output, state] : outputStates) {
-        (void)state;
+        if (state->xdgOutput != nullptr) {
+          zxdg_output_v1_destroy(state->xdgOutput);
+        }
         wl_output_destroy(output);
+      }
+      if (xdgOutputManager != nullptr) {
+        zxdg_output_manager_v1_destroy(xdgOutputManager);
+        xdgOutputManager = nullptr;
       }
       outputStates.clear();
       if (registry != nullptr) {
@@ -424,6 +434,46 @@ namespace xdpu {
         .name = onOutputName,
         .description = onOutputDescription,
     };
+
+    // Layout geometry: wl_output.geometry carries no compositor position (wlroots
+    // always sends 0,0) and the mode size ignores fractional scale, so logical
+    // coordinates need xdg-output to map onto a capture.
+    void onXdgOutputLogicalPosition(void* data, zxdg_output_v1* /*xdgOutput*/, int32_t x, int32_t y) {
+      auto* state = static_cast<WaylandContext::Impl::OutputState*>(data);
+      state->info.logicalX = x;
+      state->info.logicalY = y;
+    }
+
+    void onXdgOutputLogicalSize(void* data, zxdg_output_v1* /*xdgOutput*/, int32_t width, int32_t height) {
+      auto* state = static_cast<WaylandContext::Impl::OutputState*>(data);
+      state->info.logicalWidth = width;
+      state->info.logicalHeight = height;
+    }
+
+    // Versions before 3 apply xdg-output state here instead of on wl_output.done.
+    void onXdgOutputDone(void* data, zxdg_output_v1* /*xdgOutput*/) {
+      static_cast<WaylandContext::Impl::OutputState*>(data)->owner->rebuildOutputs();
+    }
+
+    void onXdgOutputName(void* /*data*/, zxdg_output_v1* /*xdgOutput*/, const char* /*name*/) {}
+
+    void onXdgOutputDescription(void* /*data*/, zxdg_output_v1* /*xdgOutput*/, const char* /*description*/) {}
+
+    constexpr zxdg_output_v1_listener kXdgOutputListener = {
+        .logical_position = onXdgOutputLogicalPosition,
+        .logical_size = onXdgOutputLogicalSize,
+        .done = onXdgOutputDone,
+        .name = onXdgOutputName,
+        .description = onXdgOutputDescription,
+    };
+
+    void attachXdgOutput(WaylandContext::Impl& impl, WaylandContext::Impl::OutputState& state) {
+      if (impl.xdgOutputManager == nullptr || state.xdgOutput != nullptr) {
+        return;
+      }
+      state.xdgOutput = zxdg_output_manager_v1_get_xdg_output(impl.xdgOutputManager, state.output);
+      zxdg_output_v1_add_listener(state.xdgOutput, &kXdgOutputListener, &state);
+    }
 
     // ext_image_copy_capture_session_v1.shm_format carries a wl_shm.format value,
     // not a DRM fourcc. The two agree for every format except the two wl_shm
@@ -923,9 +973,23 @@ namespace xdpu {
             static_cast<wl_output*>(wl_registry_bind(registry, name, &wl_output_interface, std::min(version, 4U)));
         auto state = std::make_unique<WaylandContext::Impl::OutputState>();
         state->output = output;
+        state->owner = impl;
         state->registryName = name;
-        impl->outputStates.emplace(output, std::move(state));
         wl_output_add_listener(output, &kOutputListener, impl);
+        attachXdgOutput(*impl, *state);
+        impl->outputStates.emplace(output, std::move(state));
+        return;
+      }
+      if (iface == zxdg_output_manager_v1_interface.name && impl->xdgOutputManager == nullptr) {
+        // Version 3 applies xdg-output state on wl_output.done, which already
+        // rebuilds the output list; older versions rebuild on zxdg_output_v1.done.
+        impl->xdgOutputManager = static_cast<zxdg_output_manager_v1*>(
+            wl_registry_bind(registry, name, &zxdg_output_manager_v1_interface, std::min(version, 3U))
+        );
+        for (auto& [output, state] : impl->outputStates) {
+          (void)output;
+          attachXdgOutput(*impl, *state);
+        }
         return;
       }
       if (iface == ext_output_image_capture_source_manager_v1_interface.name) {
@@ -980,6 +1044,9 @@ namespace xdpu {
       }
       for (auto iter = impl->outputStates.begin(); iter != impl->outputStates.end(); ++iter) {
         if (iter->second->registryName == name) {
+          if (iter->second->xdgOutput != nullptr) {
+            zxdg_output_v1_destroy(iter->second->xdgOutput);
+          }
           wl_output_destroy(iter->first);
           impl->outputStates.erase(iter);
           impl->rebuildOutputs();

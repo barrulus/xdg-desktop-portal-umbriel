@@ -25,6 +25,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <utility>
+#include <vector>
 #include <wayland-client.h>
 
 namespace xdpu {
@@ -200,17 +201,6 @@ namespace xdpu {
       return point;
     }
 
-    const OutputInfo* findOutput(const WaylandContext& wayland, const std::string& name) {
-      const auto& outputs = wayland.outputs();
-      if (!name.empty()) {
-        const auto it = std::ranges::find_if(outputs, [&](const OutputInfo& output) { return output.name == name; });
-        if (it != outputs.end()) {
-          return &*it;
-        }
-      }
-      return outputs.empty() ? nullptr : &outputs.front();
-    }
-
     std::optional<Color> sampleColor(
         const WaylandContext::ScreenshotResult& shot, const OutputInfo& output, int32_t globalX, int32_t globalY
     ) {
@@ -221,13 +211,22 @@ namespace xdpu {
         return std::nullopt;
       }
 
-      double localX = static_cast<double>(globalX - output.x);
-      double localY = static_cast<double>(globalY - output.y);
-      if (output.width > 0) {
-        localX *= static_cast<double>(shot.width) / static_cast<double>(output.width);
+      // The point is in global logical coordinates; the capture is in buffer
+      // pixels, which differ under fractional scale.  Without xdg-output, fall
+      // back to the mode geometry, which is only right at scale 1 at the origin.
+      const bool logical = output.logicalWidth > 0 && output.logicalHeight > 0;
+      const int32_t originX = logical ? output.logicalX : output.x;
+      const int32_t originY = logical ? output.logicalY : output.y;
+      const int32_t width = logical ? output.logicalWidth : output.width;
+      const int32_t height = logical ? output.logicalHeight : output.height;
+
+      double localX = static_cast<double>(globalX - originX);
+      double localY = static_cast<double>(globalY - originY);
+      if (width > 0) {
+        localX *= static_cast<double>(shot.width) / static_cast<double>(width);
       }
-      if (output.height > 0) {
-        localY *= static_cast<double>(shot.height) / static_cast<double>(output.height);
+      if (height > 0) {
+        localY *= static_cast<double>(shot.height) / static_cast<double>(height);
       }
 
       const int32_t px =
@@ -397,13 +396,15 @@ namespace xdpu {
       // finish(failureResponse) is called on any failure or timeout.
       // All protocol callbacks capture weak_ptr<Operation> to avoid cycles.
       template <typename Callback>
-      void startCapture(const std::string& outputName, uint32_t failureResponse, Callback onComplete) {
+      void startCapture(
+          const std::string& outputName, CaptureCursorMode cursorMode, uint32_t failureResponse, Callback onComplete
+      ) {
         capture = std::make_shared<CaptureState>(portal.wayland);
 
         std::weak_ptr<Operation> weakSelf = shared_from_this();
 
         capture->session = portal.wayland.createOutputCapture(
-            outputName, CaptureCursorMode::Embedded,
+            outputName, cursorMode,
             [weakSelf, failureResponse,
              onComplete = std::move(onComplete)](const CaptureConstraints& constraints) mutable {
               auto self = weakSelf.lock();
@@ -519,7 +520,7 @@ namespace xdpu {
           return;
         }
         startCapture(
-            outputName, failureResponse,
+            outputName, CaptureCursorMode::Embedded, failureResponse,
             [failureResponse](std::shared_ptr<Operation> self, WaylandContext::ScreenshotResult shot) {
               const auto path = savePng(shot);
               if (!path) {
@@ -626,13 +627,30 @@ namespace xdpu {
     struct PickColorOperation : public Operation {
       using Operation::Operation;
 
+      struct Frame {
+        OutputInfo output;
+        WaylandContext::ScreenshotResult shot;
+      };
+      std::vector<OutputInfo> outputs;
+      std::vector<Frame> frames;
+
       void start(const std::string& handle) {
         attachRequest(handle);
         if (!portal.config.screenshot.colorPickCmd.empty()) {
           runExternal();
           return;
         }
-        runSlurp();
+        // Capture before the point picker starts: once it exits, its overlay
+        // can still be on screen (the compositor fades closing layer surfaces),
+        // and a later capture would sample that overlay instead of the content.
+        outputs = portal.wayland.outputs();
+        if (outputs.empty()) {
+          std::fprintf(stderr, "screenshot: no outputs to pick a color from\n");
+          finish(1, {});
+          return;
+        }
+        frames.reserve(outputs.size());
+        captureNextOutput();
       }
 
       void finishWithColor(const Color& color) {
@@ -657,6 +675,29 @@ namespace xdpu {
             });
       }
 
+      void captureNextOutput() {
+        if (done) {
+          return;
+        }
+        if (frames.size() == outputs.size()) {
+          capture.reset();
+          runSlurp();
+          return;
+        }
+        auto self = std::static_pointer_cast<PickColorOperation>(shared_from_this());
+        // The pointer rests on the picked pixel, so an embedded cursor would be
+        // sampled instead of the content beneath it.
+        startCapture(
+            outputs[frames.size()].name, CaptureCursorMode::Hidden, 1,
+            [self](std::shared_ptr<Operation> /*base*/, WaylandContext::ScreenshotResult shot) {
+              self->cancelTimeout();
+              self->frames.push_back({self->outputs[self->frames.size()], std::move(shot)});
+              // Replace the capture state outside its own frame callback.
+              self->portal.loop.addTimer(0, [self]() { self->captureNextOutput(); });
+            }
+        );
+      }
+
       void runSlurp() {
         auto self = std::static_pointer_cast<PickColorOperation>(shared_from_this());
         process = AsyncProcess::start(portal.loop, "slurp -p -f \"%x %y %o\"", {}, [self](ProcessResult child) {
@@ -672,30 +713,39 @@ namespace xdpu {
             self->finish(1, {});
             return;
           }
-          self->captureAndSample(*point);
+          self->sample(*point);
         });
       }
 
-      void captureAndSample(const PickPoint& point) {
-        const OutputInfo* output = findOutput(portal.wayland, point.output);
-        if (output == nullptr) {
+      const Frame* frameAt(const PickPoint& point) const {
+        const auto named = std::ranges::find_if(frames, [&](const Frame& f) { return f.output.name == point.output; });
+        if (named != frames.end()) {
+          return &*named;
+        }
+        const auto containing = std::ranges::find_if(frames, [&](const Frame& f) {
+          const OutputInfo& o = f.output;
+          return point.x >= o.logicalX
+              && point.x < o.logicalX + o.logicalWidth
+              && point.y >= o.logicalY
+              && point.y < o.logicalY + o.logicalHeight;
+        });
+        return containing != frames.end() ? &*containing : nullptr;
+      }
+
+      void sample(const PickPoint& point) {
+        const Frame* frame = frameAt(point);
+        if (frame == nullptr) {
+          std::fprintf(stderr, "screenshot: no captured output contains %d,%d\n", point.x, point.y);
           finish(1, {});
           return;
         }
-        const OutputInfo outputCopy = *output; // copy — wayland state may change during async capture
-        auto self = std::static_pointer_cast<PickColorOperation>(shared_from_this());
-        startCapture(
-            outputCopy.name, 1,
-            [self, outputCopy, px = point.x,
-             py = point.y](std::shared_ptr<Operation> /*base*/, WaylandContext::ScreenshotResult shot) {
-              const auto color = sampleColor(shot, outputCopy, px, py);
-              if (!color) {
-                self->finish(1, {});
-                return;
-              }
-              self->finishWithColor(*color);
-            }
-        );
+        const auto color = sampleColor(frame->shot, frame->output, point.x, point.y);
+        if (!color) {
+          std::fprintf(stderr, "screenshot: unsupported capture format for color picking\n");
+          finish(1, {});
+          return;
+        }
+        finishWithColor(*color);
       }
     };
 

@@ -37,6 +37,7 @@ protocols = {
   'ext-image-copy-capture-v1':   wp_dir / 'staging/ext-image-copy-capture/ext-image-copy-capture-v1.xml',
   'ext-foreign-toplevel-list-v1': wp_dir / 'staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml',
   'linux-dmabuf-v1':              wp_dir / 'stable/linux-dmabuf/linux-dmabuf-v1.xml',
+  'xdg-output-unstable-v1':       wp_dir / 'unstable/xdg-output/xdg-output-unstable-v1.xml',
 }
 
 protocol_sources = []
