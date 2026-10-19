@@ -109,7 +109,8 @@ if get_option('tests')
     'tests/pipewire_buffer_params.cpp',
     include_directories: include_directories('src'),
     dependencies: [pipewire_dep, wayland_client_dep, libdrm_dep, gbm_dep],
-    cpp_args: ['-ffunction-sections', '-fdata-sections'],
+    # The test includes pipewire.cpp, so GCC treats its anonymous-namespace types as header types.
+    cpp_args: ['-ffunction-sections', '-fdata-sections', '-Wno-subobject-linkage'],
     link_args: [
       '-Wl,--gc-sections',
       '-Wl,--wrap=gbm_device_get_format_modifier_plane_count',

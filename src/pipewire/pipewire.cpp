@@ -19,7 +19,6 @@
 #include <pipewire/properties.h>
 #include <pipewire/stream.h>
 #include <pipewire/version.h>
-#include <print>
 #include <spa/buffer/alloc.h>
 #include <spa/buffer/meta.h>
 #include <spa/param/buffers.h>
@@ -438,9 +437,9 @@ namespace xdpu {
       const int dataTypes = choice.dmabuf ? (1 << SPA_DATA_DmaBuf) : (1 << SPA_DATA_MemFd);
       const int blocks = choice.dmabuf ? dmabufPlaneCount(choice) : 1;
       if (blocks <= 0) {
-        std::println(
-            stderr, "pipewire: cannot determine plane count for DMA-BUF format 0x{:08x} modifier 0x{:016x}", choice.drm,
-            choice.modifier
+        fprintf(
+            stderr, "pipewire: cannot determine plane count for DMA-BUF format 0x%08x modifier 0x%016llx\n", choice.drm,
+            static_cast<unsigned long long>(choice.modifier)
         );
         return false;
       }
